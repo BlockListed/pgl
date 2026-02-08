@@ -1,6 +1,7 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode.{type Decoder}
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
@@ -15,6 +16,7 @@ import pg_value
 import pg_value/interval
 import pgl
 import pgl/internal
+import pgl/notifications
 
 pub fn main() {
   gleeunit.main()
@@ -219,7 +221,7 @@ type PgVersion {
   // Pg18Ssl
 }
 
-fn dbs() -> Dict(PgVersion, pgl.Db) {
+fn dbs() -> Dict(PgVersion, #(pgl.Db, notifications.Notifications)) {
   use <- global_value.create_with_unique_name("pgl_pools")
 
   let base_config =
@@ -247,13 +249,21 @@ fn dbs() -> Dict(PgVersion, pgl.Db) {
     // #(Pg18Ssl, pg_18_ssl_conf),
   ]
   |> dict.from_list
-  |> dict.map_values(with: fn(_, conf) { start_db(conf) })
+  |> dict.map_values(with: fn(_, conf) {
+    let db = start_db(conf)
+    let notifications_system = notifications.new(db)
+    let assert Ok(_) = notifications.start(notifications_system)
+    #(db, notifications_system)
+  })
 }
 
-fn version(dbs: Dict(PgVersion, pgl.Db), version: PgVersion) -> pgl.Db {
+fn version(
+  dbs: Dict(PgVersion, #(pgl.Db, notifications.Notifications)),
+  version: PgVersion,
+) -> pgl.Db {
   let assert Ok(db) = dict.get(dbs, version)
 
-  db
+  db.0
 }
 
 fn start_db(conf: pgl.Config) -> pgl.Db {
@@ -338,7 +348,13 @@ fn with_hstore(conn: pgl.Connection, next: fn(pgl.Connection) -> t) -> t {
 fn with_db(next: fn(pgl.Db) -> t) {
   dbs()
   |> dict.to_list
-  |> list.map(fn(ver_db) { next(ver_db.1) })
+  |> list.map(fn(ver_db) { next(ver_db.1.0) })
+}
+
+fn with_db_and_notifications(next: fn(pgl.Db, notifications.Notifications) -> t) {
+  dbs()
+  |> dict.to_list
+  |> list.map(fn(ver_db) { next(ver_db.1.0, ver_db.1.1) })
 }
 
 fn with_conn(db: pgl.Db, next: fn(pgl.Connection) -> t) {
@@ -1657,4 +1673,17 @@ pub fn error_to_string_empty_message_test() {
   let result = pgl.error_to_string(err)
 
   assert "(QueryError)" == result
+}
+
+pub fn notifications_test() {
+  use db, notif <- with_db_and_notifications()
+  use conn <- with_conn(db)
+
+  let receiver = process.new_subject()
+  notifications.listen(notif, "pgl_testing", receiver)
+
+  let assert Ok(_) = "NOTIFY pgl_testing, 'test'" |> pgl.sql |> pgl.query(conn)
+
+  let assert Ok(notifications.Notification("pgl_testing", "test")) =
+    process.receive(receiver, 1000)
 }
